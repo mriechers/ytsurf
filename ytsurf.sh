@@ -184,7 +184,7 @@ select_from_list() {
     chosen=$(printf "%s\n" "${items[@]}" | sentaku)
   elif [[ "$use_tv" == true ]]; then
     chosen=$(tv \
-      --source-command="printf '%s\n' ${items[*]}" \
+      --source-command="printf '%s\n' $(printf '%q ' "${items[@]}")" \
       --no-preview \
       --no-remote \
       --no-help-panel \
@@ -235,6 +235,8 @@ create_desktop_entries_channel() {
     fi
     # Check if required fields exist and aren't null
     title=$(jq -r '.title' <<<"$item")
+    # Strip newlines so a crafted title can't inject extra Desktop Entry keys.
+    title=${title//$'\n'/ }
     id=$(jq -r '.channelId' <<<"$item")
     thumbnail=$(jq -r '.thumbnail' <<<"$item")
 
@@ -311,6 +313,8 @@ create_desktop_entries() {
     fi
     # Check if required fields exist and aren't null
     title=$(jq -r '.title' <<<"$item")
+    # Strip newlines so a crafted title can't inject extra Desktop Entry keys.
+    title=${title//$'\n'/ }
     id=$(jq -r '.id' <<<"$item")
     thumbnail=$(jq -r '.thumbnail' <<<"$item")
 
@@ -1185,13 +1189,13 @@ play_video() {
   #
   case "$player" in
   mpv)
-    player="$player --save-position-on-quit --keep-open=no --really-quiet --input-ipc-server=$YTSURF_SOCKET"
-    [ "$audio_only" == true ] && player="$player --no-video"
-    [ -n "$format_code" ] && player="$player --ytdl-format=\"$format_code\""
-
-
-    player="$player $video_url"
-    eval "$player"
+    # Build the command as an array and invoke it directly — no eval, so a
+    # network-derived video_url/format_code can never reach a shell parser.
+    local -a mpv_args=(mpv --save-position-on-quit --keep-open=no --really-quiet "--input-ipc-server=$YTSURF_SOCKET")
+    [ "$audio_only" == true ] && mpv_args+=(--no-video)
+    [ -n "$format_code" ] && mpv_args+=("--ytdl-format=$format_code")
+    mpv_args+=("$video_url")
+    "${mpv_args[@]}"
     # local mpv_pid=$!
     # track_playback_position "$mpv_pid" "$video_index" &
     # local watcher_pid=$!
@@ -1199,7 +1203,6 @@ play_video() {
     # wait "$mpv_pid"
     # kill "$watcher_pid" 2>/dev/null; wait "$watcher_pid" 2>/dev/null
     # trap - INT TERM
-    player="mpv"
     ;;
   syncplay)
     [ "$audio_only" == true ] && {
@@ -1210,13 +1213,11 @@ play_video() {
     exit 0
     ;;
   iina)
-    player="$player --mpv-save-position-on-quit --keep-open=no --really-quiet --input-ipc-server=$YTSURF_SOCKET"
-    [ "$audio_only" == true ] && player="$player --no-video"
-    [ -n "$format_code" ] && player="$player --ytdl-format=\"$format_code\""
-
-    player="$player $video_url"
-    eval "$player"
-    player="iina"
+    local -a iina_args=(iina --mpv-save-position-on-quit --keep-open=no --really-quiet "--input-ipc-server=$YTSURF_SOCKET")
+    [ "$audio_only" == true ] && iina_args+=(--no-video)
+    [ -n "$format_code" ] && iina_args+=("--ytdl-format=$format_code")
+    iina_args+=("$video_url")
+    "${iina_args[@]}"
     ;;
   esac
 }
