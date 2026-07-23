@@ -383,20 +383,65 @@ EOF
 }
 
 update_script() {
+  local which_ytsurf tag url new_script update reply dir tmp
   which_ytsurf="$(command -v ytsurf)"
-  [ -z "$which_ytsurf" ] && send_notification "Can't find ytsurf in PATH"
-  [ -z "$which_ytsurf" ] && exit 1
-  update=$(curl -s "https://raw.githubusercontent.com/Stan-breaks/ytsurf/main/ytsurf.sh" || exit 1)
-  update="$(printf '%s\n' "$update" | diff -u "$which_ytsurf" -)"
-  if [ -z "$update" ]; then
-    send_notification "Script is up to date :)"
-  else
-    if printf '%s\n' "$update" | patch "$which_ytsurf" -; then
-      send_notification "Success" "Script has been updated!"
-    else
-      send_notification "Error" "Can't update for some reason! update with Paru or yay if on archlinux"
-    fi
+  [ -z "$which_ytsurf" ] && {
+    send_notification "Error" "Can't find ytsurf in PATH"
+    exit 1
+  }
+
+  # Pin to the latest tagged release instead of the moving `main` branch, so an
+  # update is a named, immutable revision rather than whatever main is right now.
+  tag=$(curl -fsSL "https://api.github.com/repos/Stan-breaks/ytsurf/releases/latest" 2>/dev/null | jq -r '.tag_name // empty')
+  [ -z "$tag" ] && tag=$(curl -fsSL "https://api.github.com/repos/Stan-breaks/ytsurf/tags" 2>/dev/null | jq -r '.[0].name // empty')
+  if [ -z "$tag" ]; then
+    send_notification "Error" "Could not determine the latest release tag"
+    exit 1
   fi
+
+  url="https://raw.githubusercontent.com/Stan-breaks/ytsurf/${tag}/ytsurf.sh"
+  if ! new_script=$(curl -fsSL "$url"); then
+    send_notification "Error" "Could not download ytsurf ${tag}"
+    exit 1
+  fi
+
+  update="$(printf '%s\n' "$new_script" | diff -u "$which_ytsurf" - || true)"
+  if [ -z "$update" ]; then
+    send_notification "Already on the latest release (${tag}) :)"
+    exit 0
+  fi
+
+  # Show exactly what would change and require explicit confirmation before
+  # touching the on-disk script — no silent patch-from-the-internet.
+  printf '%s\n' "$update"
+  printf '\nApply this update to %s (release %s)? [y/N] ' "$which_ytsurf" "$tag" >&2
+  read -r reply
+  case "$reply" in
+  y | Y | yes | YES)
+    # Replace atomically via a temp file in the same dir; a running copy keeps
+    # its already-open inode and finishes cleanly.
+    dir="$(dirname "$which_ytsurf")"
+    if ! tmp="$(mktemp "${dir}/.ytsurf.XXXXXX")"; then
+      send_notification "Error" "Could not create temp file (is ${dir} writable?)"
+      exit 1
+    fi
+    if printf '%s\n' "$new_script" >"$tmp"; then
+      chmod 0755 "$tmp"
+      if mv "$tmp" "$which_ytsurf"; then
+        send_notification "Success" "Updated to ${tag}"
+      else
+        rm -f "$tmp"
+        send_notification "Error" "Could not replace ${which_ytsurf}"
+      fi
+    else
+      rm -f "$tmp"
+      send_notification "Error" "Failed to write update"
+    fi
+    ;;
+  *)
+    send_notification "Update cancelled"
+    ;;
+  esac
   exit 0
 }
 
@@ -412,13 +457,43 @@ edit_config() {
 }
 
 # configuration
+# Safely load the user config: parse key=value for a fixed set of known keys
+# instead of `source`-ing the file (which would execute arbitrary code). Only
+# ~ and $HOME are expanded in values, never command substitution or other vars.
+parse_config() {
+  local file="$1" line key value
+  local -A allowed=(
+    [limit]=1 [audio_only]=1 [use_rofi]=1 [use_sentaku]=1 [use_tv]=1
+    [download_mode]=1 [history_mode]=1 [playlist_mode]=1 [format_selection]=1
+    [download_dir]=1 [history_file]=1 [max_history_entries]=1 [notify]=1
+    [editor]=1 [player]=1 [debug_mode]=1 [chafa_block_mode]=1
+  )
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line#"${line%%[![:space:]]*}"}"          # strip leading whitespace
+    [[ -z "$line" || "$line" == \#* ]] && continue    # skip blanks and comments
+    [[ "$line" == *=* ]] || continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    key="${key//[[:space:]]/}"
+    [[ -n "${allowed[$key]:-}" ]] || continue         # only whitelisted keys
+    value="${value%$'\r'}"                             # tolerate CRLF files
+    value="${value#"${value%%[![:space:]]*}"}"         # trim leading whitespace
+    value="${value%"${value##*[![:space:]]}"}"         # trim trailing whitespace
+    if [[ "$value" == \"*\" || "$value" == \'*\' ]]; then
+      value="${value:1:${#value}-2}"                  # strip one layer of quotes
+    fi
+    value="${value//\$\{HOME\}/$HOME}"
+    value="${value//\$HOME/$HOME}"
+    value="${value/#\~/$HOME}"
+    printf -v "$key" '%s' "$value"                     # assign as data, never eval
+  done <"$file"
+}
+
 configuration() {
   mkdir -p "$CACHE_DIR" "$CONFIG_DIR" "$PLAYLIST_DIR"
 
   [ -f "$SUB_FILE" ] || echo "[]" >"$SUB_FILE"
   echo "[]" >"$QUEUE_FILE"
-
-  # shellcheck source=/home/stan/.config/ytsurf/config
 
   if [ ! -f "$CONFIG_FILE" ]; then
     cat >"$CONFIG_FILE" <<'EOF'
@@ -441,8 +516,7 @@ configuration() {
 #chafa_block_mode=false
 EOF
   fi
-  # shellcheck disable=SC1090
-  [ -f "$CONFIG_FILE" ] && source "$CONFIG_FILE"
+  [ -f "$CONFIG_FILE" ] && parse_config "$CONFIG_FILE"
   [ -f "$history_file" ] || echo "[]" >"$history_file"
 }
 
@@ -649,6 +723,16 @@ sync_subs() {
     header="Select a broswer where your youtube has be logged in"
     items=("brave" "chrome" "chromium" "edge" "firefox" "opera" "safari" "vivaldi" "whale")
     chosen_action=$(select_from_list "$prompt" "$header" "${items[@]}")
+
+    # Reading the browser cookie store touches logged-in credentials — require an
+    # explicit, per-use opt-in that names the browser before yt-dlp is invoked.
+    local cookie_ok
+    cookie_ok=$(select_from_list "Confirm cookie access:" "ytsurf will read ${chosen_action}'s cookies to reach your logged-in YouTube account. Allow?" "Yes" "No")
+    if [[ "$cookie_ok" != "Yes" ]]; then
+      send_notification "Cancelled" "Cookie access denied; subscriptions not synced"
+      exit 0
+    fi
+
     if json_data=$(yt-dlp --cookies-from-browser "$chosen_action" --flat-playlist https://www.youtube.com/feed/channels -J); then
       echo "$json_data" | jq -r '.entries
       | map({
